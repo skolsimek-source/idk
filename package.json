@@ -7,8 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "server": "node server/index.mjs",
-    "start": "node server/index.mjs"
+    "server": "node --experimental-sqlite server/index.mjs",
+    "start": "node --experimental-sqlite server/index.mjs"
   },
   "dependencies": {
     "canvas-confetti": "^1.9.4",
