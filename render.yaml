@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: focusflow
+    runtime: node
+    plan: free
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: node server/index.mjs
+    envVars:
+      - key: NODE_VERSION
+        value: 22.12.0
