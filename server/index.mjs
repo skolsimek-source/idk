@@ -3,14 +3,16 @@ import cors from 'cors';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { 
-  db, initDB, hashPassword, verifyPassword, generateToken, 
-  seedTasksForUser, formatTaskRow 
+  initDB, hashPassword, verifyPassword, generateToken, 
+  findUserByEmail, createUser, createSession, findSessionWithUser,
+  deleteSession, getUserTasks, createTask, updateTask, deleteTask,
+  saveTrackingSession, getUserStats, seedTasksForUser
 } from './db.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Initialize SQLite tables & demo account
+// Initialize Database & Default Demo User
 initDB();
 
 const app = express();
@@ -32,14 +34,7 @@ function authenticate(req, res, next) {
   const now = new Date().toISOString();
 
   try {
-    const stmt = db.prepare(`
-      SELECT s.token, u.id as userId, u.email, u.name
-      FROM sessions s
-      JOIN users u ON s.userId = u.id
-      WHERE s.token = ? AND s.expiresAt > ?
-    `);
-
-    const session = stmt.get(token, now);
+    const session = findSessionWithUser(token, now);
     if (!session) {
       return res.status(401).json({ error: 'Relace vypršela nebo je neplatná.' });
     }
@@ -62,10 +57,9 @@ function authenticate(req, res, next) {
 function optionalAuth(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    // Fallback to default demo user if guest
-    const demoUser = db.prepare('SELECT id, email, name FROM users WHERE email = ?').get('demo@focusflow.app');
+    const demoUser = findUserByEmail('demo@focusflow.app');
     if (demoUser) {
-      req.user = demoUser;
+      req.user = { id: demoUser.id, email: demoUser.email, name: demoUser.name };
     }
     return next();
   }
@@ -85,7 +79,7 @@ app.post('/api/auth/register', (req, res) => {
     }
 
     const cleanEmail = email.trim().toLowerCase();
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(cleanEmail);
+    const existing = findUserByEmail(cleanEmail);
     if (existing) {
       return res.status(409).json({ error: 'Účet s tímto emailem již existuje.' });
     }
@@ -94,20 +88,19 @@ app.post('/api/auth/register', (req, res) => {
     const { hash, salt } = hashPassword(password);
     const createdAt = new Date().toISOString();
 
-    const insertUser = db.prepare(`
-      INSERT INTO users (id, email, name, passwordHash, salt, createdAt)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    insertUser.run(userId, cleanEmail, name.trim(), hash, salt, createdAt);
+    createUser({
+      id: userId,
+      email: cleanEmail,
+      name: name.trim(),
+      passwordHash: hash,
+      salt: salt,
+      createdAt
+    });
 
     // Create session (valid 30 days)
     const token = generateToken();
     const expiresAt = new Date(Date.now() + 30 * 86400000).toISOString();
-    const insertSession = db.prepare(`
-      INSERT INTO sessions (token, userId, expiresAt, createdAt)
-      VALUES (?, ?, ?, ?)
-    `);
-    insertSession.run(token, userId, expiresAt, createdAt);
+    createSession(token, userId, expiresAt);
 
     // Seed starter goals for the new user
     seedTasksForUser(userId);
@@ -131,7 +124,7 @@ app.post('/api/auth/login', (req, res) => {
     }
 
     const cleanEmail = email.trim().toLowerCase();
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(cleanEmail);
+    const user = findUserByEmail(cleanEmail);
     if (!user) {
       return res.status(401).json({ error: 'Nesprávný email nebo heslo.' });
     }
@@ -144,11 +137,7 @@ app.post('/api/auth/login', (req, res) => {
     // Create session token
     const token = generateToken();
     const expiresAt = new Date(Date.now() + 30 * 86400000).toISOString();
-    const insertSession = db.prepare(`
-      INSERT INTO sessions (token, userId, expiresAt, createdAt)
-      VALUES (?, ?, ?, ?)
-    `);
-    insertSession.run(token, user.id, expiresAt, new Date().toISOString());
+    createSession(token, user.id, expiresAt);
 
     res.json({
       user: { id: user.id, email: user.email, name: user.name },
@@ -168,8 +157,7 @@ app.get('/api/auth/me', authenticate, (req, res) => {
 // Logout (destroy session token)
 app.post('/api/auth/logout', authenticate, (req, res) => {
   try {
-    const deleteSession = db.prepare('DELETE FROM sessions WHERE token = ?');
-    deleteSession.run(req.user.token);
+    deleteSession(req.user.token);
     res.json({ success: true, message: 'Úspěšně odhlášeno.' });
   } catch (err) {
     res.status(500).json({ error: 'Chyba při odhlašování' });
@@ -182,7 +170,7 @@ app.post('/api/auth/logout', authenticate, (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    engine: 'Node.js + SQLite',
+    engine: 'Node.js Full-Stack Storage',
     authSystem: 'PBKDF2 Sessions Token',
     uptime: Math.floor(process.uptime()),
     timestamp: new Date().toISOString()
@@ -196,24 +184,7 @@ app.get('/api/health', (req, res) => {
 // Get all tasks for current authenticated user
 app.get('/api/tasks', optionalAuth, (req, res) => {
   try {
-    const userId = req.user.id;
-    const stmt = db.prepare(`
-      SELECT 
-        t.id, t.userId, t.title, t.description, t.category, t.scheduledDate,
-        t.startTime, t.endTime, t.estimatedDurationMinutes,
-        t.reminderMinutesBefore, t.status, t.createdAt,
-        s.preEnergyLevel, s.preMood, s.preIntentions, s.startedCheckInAt,
-        s.actualStartTime, s.actualEndTime, s.actualDurationSeconds,
-        s.postCompletedAt, s.postFocusRating, s.postEnergyLevelAfter,
-        s.postMoodAfter, s.postHowItWent, s.postIsGoalAchieved, s.timeDifferenceMinutes
-      FROM tasks t
-      LEFT JOIN tracking_sessions s ON t.id = s.taskId
-      WHERE t.userId = ?
-      ORDER BY t.scheduledDate DESC, t.startTime ASC
-    `);
-
-    const rows = stmt.all(userId);
-    const tasks = rows.map(formatTaskRow);
+    const tasks = getUserTasks(req.user.id);
     res.json(tasks);
   } catch (err) {
     console.error('Error fetching tasks:', err);
@@ -244,30 +215,7 @@ app.post('/api/tasks', optionalAuth, (req, res) => {
     const createdAt = new Date().toISOString();
     const status = 'scheduled';
 
-    const stmt = db.prepare(`
-      INSERT INTO tasks (
-        id, userId, title, description, category, scheduledDate,
-        startTime, endTime, estimatedDurationMinutes, reminderMinutesBefore,
-        status, createdAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    stmt.run(
-      id,
-      userId,
-      title,
-      description || null,
-      category,
-      scheduledDate,
-      startTime,
-      endTime,
-      Number(estimatedDurationMinutes),
-      Number(reminderMinutesBefore),
-      status,
-      createdAt
-    );
-
-    const createdTask = {
+    const createdTask = createTask({
       id,
       userId,
       title,
@@ -280,7 +228,7 @@ app.post('/api/tasks', optionalAuth, (req, res) => {
       reminderMinutesBefore: Number(reminderMinutesBefore),
       status,
       createdAt
-    };
+    });
 
     res.status(201).json(createdTask);
   } catch (err) {
@@ -294,46 +242,7 @@ app.put('/api/tasks/:id', optionalAuth, (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
-    const {
-      title,
-      description,
-      category,
-      scheduledDate,
-      startTime,
-      endTime,
-      estimatedDurationMinutes,
-      reminderMinutesBefore,
-      status
-    } = req.body;
-
-    const stmt = db.prepare(`
-      UPDATE tasks SET
-        title = COALESCE(?, title),
-        description = COALESCE(?, description),
-        category = COALESCE(?, category),
-        scheduledDate = COALESCE(?, scheduledDate),
-        startTime = COALESCE(?, startTime),
-        endTime = COALESCE(?, endTime),
-        estimatedDurationMinutes = COALESCE(?, estimatedDurationMinutes),
-        reminderMinutesBefore = COALESCE(?, reminderMinutesBefore),
-        status = COALESCE(?, status)
-      WHERE id = ? AND userId = ?
-    `);
-
-    stmt.run(
-      title,
-      description,
-      category,
-      scheduledDate,
-      startTime,
-      endTime,
-      estimatedDurationMinutes,
-      reminderMinutesBefore,
-      status,
-      id,
-      userId
-    );
-
+    updateTask(id, userId, req.body);
     res.json({ success: true, id });
   } catch (err) {
     console.error('Error updating task:', err);
@@ -346,8 +255,7 @@ app.delete('/api/tasks/:id', optionalAuth, (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
-    const stmt = db.prepare('DELETE FROM tasks WHERE id = ? AND userId = ?');
-    stmt.run(id, userId);
+    deleteTask(id, userId);
     res.json({ success: true, deletedId: id });
   } catch (err) {
     console.error('Error deleting task:', err);
@@ -361,57 +269,12 @@ app.post('/api/tasks/:id/track', optionalAuth, (req, res) => {
     const { id: taskId } = req.params;
     const userId = req.user.id;
 
-    // Verify task ownership
-    const task = db.prepare('SELECT id FROM tasks WHERE id = ? AND userId = ?').get(taskId, userId);
-    if (!task) {
-      return res.status(404).json({ error: 'Cíl nenalezen nebo k němu nemáte oprávnění.' });
-    }
-
-    const { preCheckIn, actualStartTime, actualEndTime, actualDurationSeconds, postReflection } = req.body;
-
-    if (!preCheckIn) {
+    if (!req.body.preCheckIn) {
       return res.status(400).json({ error: 'Chybí data fáze PŘED (check-in)' });
     }
 
-    const sessionId = `track-${Date.now()}`;
-
-    // Upsert tracking session
-    const deleteOld = db.prepare('DELETE FROM tracking_sessions WHERE taskId = ?');
-    deleteOld.run(taskId);
-
-    const insertStmt = db.prepare(`
-      INSERT INTO tracking_sessions (
-        id, taskId, preEnergyLevel, preMood, preIntentions, startedCheckInAt,
-        actualStartTime, actualEndTime, actualDurationSeconds,
-        postCompletedAt, postFocusRating, postEnergyLevelAfter, postMoodAfter,
-        postHowItWent, postIsGoalAchieved, timeDifferenceMinutes
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    insertStmt.run(
-      sessionId,
-      taskId,
-      preCheckIn.energyLevel || 5,
-      preCheckIn.mood || 'focused',
-      preCheckIn.intentions || '',
-      preCheckIn.startedCheckInAt || new Date().toISOString(),
-      actualStartTime || new Date().toISOString(),
-      actualEndTime || new Date().toISOString(),
-      actualDurationSeconds || 0,
-      postReflection?.completedAt || new Date().toISOString(),
-      postReflection?.focusRating || 5,
-      postReflection?.energyLevelAfter || 5,
-      postReflection?.moodAfter || 'focused',
-      postReflection?.howItWent || '',
-      postReflection?.isGoalAchieved ? 1 : 0,
-      postReflection?.timeDifferenceMinutes || 0
-    );
-
-    // Update task status to completed
-    const updateTask = db.prepare("UPDATE tasks SET status = 'completed' WHERE id = ?");
-    updateTask.run(taskId);
-
-    res.json({ success: true, taskId, sessionId });
+    saveTrackingSession(taskId, userId, req.body);
+    res.json({ success: true, taskId });
   } catch (err) {
     console.error('Error saving tracking session:', err);
     res.status(500).json({ error: 'Chyba při ukládání měření', details: err.message });
@@ -421,31 +284,8 @@ app.post('/api/tasks/:id/track', optionalAuth, (req, res) => {
 // Aggregate Statistics for user
 app.get('/api/stats', optionalAuth, (req, res) => {
   try {
-    const userId = req.user.id;
-    const totalStmt = db.prepare(`
-      SELECT 
-        COUNT(*) as totalCompleted,
-        COALESCE(SUM(s.actualDurationSeconds), 0) as totalSeconds,
-        COALESCE(AVG(s.preEnergyLevel), 0) as avgPreEnergy,
-        COALESCE(AVG(s.postEnergyLevelAfter), 0) as avgPostEnergy,
-        COALESCE(AVG(s.postFocusRating), 0) as avgFocus,
-        COALESCE(SUM(s.postIsGoalAchieved), 0) as achievedGoalsCount
-      FROM tracking_sessions s
-      JOIN tasks t ON s.taskId = t.id
-      WHERE t.userId = ?
-    `);
-    const stats = totalStmt.get(userId);
-
-    res.json({
-      totalCompleted: stats.totalCompleted,
-      totalSeconds: stats.totalSeconds,
-      avgPreEnergy: Number(stats.avgPreEnergy.toFixed(1)),
-      avgPostEnergy: Number(stats.avgPostEnergy.toFixed(1)),
-      avgFocus: Number(stats.avgFocus.toFixed(1)),
-      successRate: stats.totalCompleted > 0 
-        ? Math.round((stats.achievedGoalsCount / stats.totalCompleted) * 100) 
-        : 0
-    });
+    const stats = getUserStats(req.user.id);
+    res.json(stats);
   } catch (err) {
     console.error('Error calculating stats:', err);
     res.status(500).json({ error: 'Chyba při výpočtu statistik' });
@@ -456,7 +296,8 @@ app.get('/api/stats', optionalAuth, (req, res) => {
 app.post('/api/reset', optionalAuth, (req, res) => {
   try {
     const userId = req.user.id;
-    db.prepare('DELETE FROM tasks WHERE userId = ?').run(userId);
+    const tasks = getUserTasks(userId);
+    tasks.forEach(t => deleteTask(t.id, userId));
     seedTasksForUser(userId);
     res.json({ success: true, message: 'Data uživatele byla resetována.' });
   } catch (err) {
@@ -475,6 +316,5 @@ app.get('*', (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 FocusFlow Full-Stack Server with Auth running at http://0.0.0.0:${PORT}`);
-  console.log(`📁 SQLite Database: ${path.join(__dirname, 'focusflow.sqlite')}`);
+  console.log(`🚀 FocusFlow Full-Stack Server running at http://0.0.0.0:${PORT}`);
 });
